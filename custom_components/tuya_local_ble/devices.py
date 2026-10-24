@@ -250,7 +250,7 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
                 [
                     "blliqpsj",
                     "ndvkgsrm",
-                    "yiihr7zh", 
+                    "yiihr7zh",
                     "neq16kgd"
                 ],  # device product_ids
                 TuyaBLEProductInfo(
@@ -265,6 +265,19 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
                         manual_control=17,
                         program=121,
                     ),
+                ),
+            ),
+            "mknd4lci": TuyaBLEProductInfo(  # BS-FB-V3.1 (switch is dp 1)
+                name="Fingerbot Plus",
+                fingerbot=TuyaBLEFingerbotInfo(
+                    switch=1,
+                    mode=8,
+                    up_position=15,
+                    down_position=9,
+                    hold_time=10,
+                    reverse_positions=11,
+                    manual_control=17,
+                    program=121,
                 ),
             ),
             **dict.fromkeys(

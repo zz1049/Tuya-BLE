@@ -237,6 +237,9 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     ),
                 ],
             ),
+            "mknd4lci": [  # Box Fan
+                TuyaBLEFingerbotSwitchMapping(dp_id=1),
+            ],
             **dict.fromkeys(
                 [
                     "ltak7e1p",

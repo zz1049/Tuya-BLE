@@ -210,6 +210,19 @@ class TuyaBLEDataPoints:
 
 global_connect_lock = asyncio.Lock()
 
+# --- Connection-stability safeguards (fork patch) ---------------------------
+# Attempts per connection cycle (upstream: 100, back to back, no cleanup).
+CONNECT_ATTEMPTS = 3
+# Pause between attempts inside one cycle, seconds.
+CONNECT_ATTEMPT_PAUSE = 2.0
+# After a failed cycle, wait BASE * 2**(n-1) seconds (capped) before retrying.
+CONNECT_COOLDOWN_BASE = 10.0
+CONNECT_COOLDOWN_MAX = 600.0
+# Max time allowed for cleaning up an abandoned client, seconds.
+CLEANUP_TIMEOUT = 10.0
+# Repeats of the same error are logged at most once per this many seconds.
+LOG_THROTTLE_SECONDS = 60.0
+
 
 class TuyaBLEDevice:
     def __init__(
@@ -253,6 +266,15 @@ class TuyaBLEDevice:
         self._session_key: bytes | None = None
 
         self._is_paired = False
+
+        # Fork patch: recovery state
+        self._reconnect_task: asyncio.Task | None = None
+        self._resend_task: asyncio.Task | None = None
+        self._connect_failures = 0
+        self._next_connect_allowed = 0.0
+        self._use_services_cache = True
+        self._log_last: dict[str, float] = {}
+        self._log_suppressed: dict[str, int] = {}
 
         self._input_buffer: bytearray | None = None
         self._input_expected_packet_num = 0
@@ -499,6 +521,10 @@ class TuyaBLEDevice:
     async def stop(self) -> None:
         """Stop the TuyaBLE."""
         _LOGGER.debug("%s: Stop", self.address)
+        self._expected_disconnect = True
+        for task in (self._reconnect_task, self._resend_task):
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
         await self._execute_disconnect()
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
@@ -525,7 +551,7 @@ class TuyaBLEDevice:
                 self.address,
                 self.rssi,
             )
-            asyncio.create_task(self._reconnect())
+            self._schedule_reconnect()
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -545,13 +571,12 @@ class TuyaBLEDevice:
             client = self._client
             self._expected_disconnect = True
             self._client = None
-            if client and client.is_connected:
-                await client.stop_notify(self._characteristic_notify)
-                await client.disconnect()
+            if client:
+                await self._discard_client(client)
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
-    def _select_characteristics(self, client: BleakClientWithServiceCache) -> None:
+    def _select_characteristics(self, client: BleakClientWithServiceCache) -> bool:
         """Select the GATT channel actually exposed by the device."""
         if client.services.get_characteristic(CHARACTERISTIC_NOTIFY):
             self._characteristic_notify = CHARACTERISTIC_NOTIFY
@@ -565,6 +590,69 @@ class TuyaBLEDevice:
             self._characteristic_notify = CHARACTERISTIC_NOTIFY_FD50
             self._characteristic_write = CHARACTERISTIC_WRITE_FD50
             self._uses_fd50_channel = True
+        else:
+            return False
+        return True
+
+    def _log_throttled(
+        self, key: str, level: int, msg: str, *args, exc_info: bool = False
+    ) -> None:
+        """Log at `level` at most once per LOG_THROTTLE_SECONDS per key.
+
+        Repeats are demoted to DEBUG so a failing device cannot flood the log.
+        """
+        now = time.monotonic()
+        if now - self._log_last.get(key, -1e9) >= LOG_THROTTLE_SECONDS:
+            self._log_last[key] = now
+            suppressed = self._log_suppressed.pop(key, 0)
+            if suppressed:
+                msg += " (%s similar messages suppressed)"
+                args = (*args, suppressed)
+            _LOGGER.log(level, msg, *args, exc_info=exc_info)
+        else:
+            self._log_suppressed[key] = self._log_suppressed.get(key, 0) + 1
+            _LOGGER.debug(msg, *args)
+
+    async def _discard_client(self, client) -> None:
+        """Best-effort, time-boxed release of a BLE client. Never raises."""
+        if client is None:
+            return
+
+        async def _close() -> None:
+            if client.is_connected:
+                try:
+                    await client.stop_notify(self._characteristic_notify)
+                except Exception:  # noqa: BLE001
+                    pass
+            await client.disconnect()
+
+        try:
+            await asyncio.wait_for(_close(), CLEANUP_TIMEOUT)
+        except Exception:  # noqa: BLE001 - includes timeouts and bleak errors
+            _LOGGER.debug("%s: cleanup of BLE client failed",
+                          self.address, exc_info=True)
+
+    async def _abandon_client(self, client) -> None:
+        """Drop a half-set-up client WITHOUT leaving the connection open."""
+        if self._client is client:
+            self._client = None
+        await self._discard_client(client)
+
+    def _register_connect_failure(self) -> None:
+        self._connect_failures += 1
+        delay = min(
+            CONNECT_COOLDOWN_MAX,
+            CONNECT_COOLDOWN_BASE * 2 ** (self._connect_failures - 1),
+        )
+        self._next_connect_allowed = time.monotonic() + delay
+        self._log_throttled(
+            "cooldown",
+            logging.WARNING,
+            "%s: connecting failed (%s cycles in a row); pausing %.0fs",
+            self.address,
+            self._connect_failures,
+            delay,
+        )
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
@@ -585,35 +673,38 @@ class TuyaBLEDevice:
             await asyncio.sleep(0.01)
             if self._client and self._client.is_connected and self._is_paired:
                 return
-            attempts_count = 100
-            while attempts_count > 0:
-                attempts_count -= 1
-                if attempts_count == 0:
-                    _LOGGER.error(
-                        "%s: Connecting, all attempts failed; RSSI: %s",
-                        self.address,
-                        self.rssi,
-                    )
-                    raise BleakNotFoundError()
+            wait = self._next_connect_allowed - time.monotonic()
+            if wait > 0:
+                # Circuit breaker: do not hammer a device that just failed.
+                raise BleakNotFoundError(
+                    f"{self.address}: cooling down for {wait:.0f}s more"
+                )
+            connected = False
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                if self._expected_disconnect:
+                    return
+                if attempt > 1:
+                    await asyncio.sleep(CONNECT_ATTEMPT_PAUSE)
+                client = None
                 try:
                     async with global_connect_lock:
                         _LOGGER.debug(
-                            "%s: Connecting; RSSI: %s", self.address, self.rssi
+                            "%s: Connecting (attempt %s/%s); RSSI: %s",
+                            self.address, attempt, CONNECT_ATTEMPTS, self.rssi,
                         )
                         client = await establish_connection(
                             BleakClientWithServiceCache,
                             self._ble_device,
                             self.address,
                             self._disconnected,
-                            use_services_cache=True,
+                            use_services_cache=self._use_services_cache,
                             ble_device_callback=lambda: self._ble_device,
                         )
                 except BleakNotFoundError:
-                    _LOGGER.error(
+                    self._log_throttled(
+                        "notfound", logging.ERROR,
                         "%s: device not found, not in range, or poor RSSI: %s",
-                        self.address,
-                        self.rssi,
-                        exc_info=True,
+                        self.address, self.rssi,
                     )
                     continue
                 except BLEAK_EXCEPTIONS:
@@ -621,88 +712,96 @@ class TuyaBLEDevice:
                         "%s: communication failed", self.address, exc_info=True
                     )
                     continue
-                except:
+                except Exception:  # noqa: BLE001
                     _LOGGER.debug("%s: unexpected error",
                                   self.address, exc_info=True)
                     continue
 
-                if client and client.is_connected:
-                    _LOGGER.debug("%s: Connected; RSSI: %s",
-                                  self.address, self.rssi)
-                    self._client = client
-                    self._select_characteristics(client)
-                    try:
-                        await self._client.start_notify(
-                            self._characteristic_notify,
-                            self._notification_handler,
-                            bluez={"use_start_notify": True},
+                if not (client and client.is_connected):
+                    await self._abandon_client(client)
+                    continue
+
+                _LOGGER.debug("%s: Connected; RSSI: %s", self.address, self.rssi)
+                self._client = client
+                if not self._select_characteristics(client):
+                    # Stale GATT cache is the usual cause: refresh next time.
+                    self._use_services_cache = False
+                    self._log_throttled(
+                        "nochar", logging.WARNING,
+                        "%s: expected Tuya GATT characteristics not found;"
+                        " will refresh the GATT cache and retry",
+                        self.address,
+                    )
+                    await self._abandon_client(client)
+                    continue
+                try:
+                    await self._client.start_notify(
+                        self._characteristic_notify,
+                        self._notification_handler,
+                        bluez={"use_start_notify": True},
+                    )
+                except Exception:  # noqa: BLE001
+                    self._log_throttled(
+                        "notify", logging.ERROR,
+                        "%s: starting notifications failed",
+                        self.address, exc_info=True,
+                    )
+                    await self._abandon_client(client)
+                    continue
+
+                _LOGGER.debug("%s: Sending device info request", self.address)
+                try:
+                    # Any device negotiating the FD50 GATT channel needs the
+                    # same TuyaOS device-info handshake as hc7n0urm/ikphogdj.
+                    device_info_payload = (
+                        b"\x00\xf3"
+                        if (
+                            self.product_id in ("hc7n0urm", "ikphogdj")
+                            or self._uses_fd50_channel
                         )
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: starting notifications failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
+                        else bytes(0)
+                    )
+                    ok = await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_DEVICE_INFO,
+                        device_info_payload, 0, True,
+                    )
+                except Exception:  # noqa: BLE001
+                    ok = False
+                if not ok:
+                    self._log_throttled(
+                        "devinfo", logging.ERROR,
+                        "%s: Sending device info request failed", self.address,
+                    )
+                    await self._abandon_client(client)
                     continue
 
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug(
-                        "%s: Sending device info request", self.address)
-                    try:
-                        # Any device negotiating the FD50 GATT channel needs the
-                        # same TuyaOS device-info handshake as hc7n0urm/ikphogdj.
-                        device_info_payload = (
-                            b"\x00\xf3"
-                            if (
-                                self.product_id in ("hc7n0urm", "ikphogdj")
-                                or self._uses_fd50_channel
-                            )
-                            else bytes(0)
-                        )
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                            device_info_payload,
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending device info request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending device info request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
+                _LOGGER.debug("%s: Sending pairing request", self.address)
+                try:
+                    ok = await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_PAIR,
+                        self._build_pairing_request(), 0, True,
+                    )
+                except Exception:  # noqa: BLE001
+                    ok = False
+                if not ok:
+                    self._log_throttled(
+                        "pair", logging.ERROR,
+                        "%s: Sending pairing request failed", self.address,
+                    )
+                    await self._abandon_client(client)
                     continue
 
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending pairing request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_PAIR,
-                            self._build_pairing_request(),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending pairing request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending pairing request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
+                connected = True
                 break
+
+            if not connected:
+                self._register_connect_failure()
+                raise BleakNotFoundError(
+                    f"{self.address}: all {CONNECT_ATTEMPTS} connect attempts failed"
+                )
+            self._connect_failures = 0
+            self._next_connect_allowed = 0.0
+            self._use_services_cache = True
 
         if self._client:
             if self._client.is_connected:
@@ -710,33 +809,61 @@ class TuyaBLEDevice:
                     _LOGGER.debug("%s: Successfully connected", self.address)
                     self._fire_connected_callbacks()
                 else:
-                    _LOGGER.error("%s: Connected but not paired", self.address)
+                    self._log_throttled(
+                        "notpaired", logging.ERROR,
+                        "%s: Connected but not paired", self.address,
+                    )
             else:
-                _LOGGER.error("%s: Not connected", self.address)
+                self._log_throttled(
+                    "notconn", logging.ERROR, "%s: Not connected", self.address)
         else:
-            _LOGGER.error("%s: No client device", self.address)
+            self._log_throttled(
+                "noclient", logging.ERROR, "%s: No client device", self.address)
+
+    def _schedule_reconnect(self) -> None:
+        """Start ONE background reconnect loop (never more than one)."""
+        if self._expected_disconnect:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
+
+    def _schedule_recovery(self, packets: list[bytes]) -> None:
+        """After a send error: at most one resend or reconnect in flight."""
+        if self._is_paired:
+            if self._resend_task and not self._resend_task.done():
+                return
+            self._resend_task = asyncio.create_task(
+                self._resend_packets_safe(packets))
+        else:
+            self._schedule_reconnect()
+
+    async def _resend_packets_safe(self, packets: list[bytes]) -> None:
+        try:
+            await self._resend_packets(packets)
+        except BLEAK_EXCEPTIONS:
+            _LOGGER.debug("%s: resend failed", self.address, exc_info=True)
 
     async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
+        """Reconnect loop with exponential backoff (single task)."""
         _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
         async with self._seq_num_lock:
             self._current_seq_num = 1
-        try:
-            if self._expected_disconnect:
+        while not self._expected_disconnect:
+            try:
+                await self._ensure_connected()
+                _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
                 return
-            await self._ensure_connected()
-            if self._expected_disconnect:
-                return
-            _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
-        except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
-            _LOGGER.debug(
-                "%s: Reconnect, failed to ensure connection - backing off",
-                self.address,
-                exc_info=True,
-            )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.address)
-            asyncio.create_task(self._reconnect())
+            except BLEAK_EXCEPTIONS:
+                delay = max(
+                    BLEAK_BACKOFF_TIME,
+                    self._next_connect_allowed - time.monotonic(),
+                )
+                _LOGGER.debug(
+                    "%s: Reconnect failed - backing off %.0fs",
+                    self.address, delay, exc_info=True,
+                )
+                await asyncio.sleep(delay)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -970,18 +1097,16 @@ class TuyaBLEDevice:
         try:
             await self._send_packets_locked(packets)
         except BleakNotFoundError:
-            _LOGGER.error(
+            self._log_throttled(
+                "send-notfound", logging.ERROR,
                 "%s: device not found, no longer in range, or poor RSSI: %s",
-                self.address,
-                self.rssi,
-                exc_info=True,
+                self.address, self.rssi,
             )
             raise
         except BLEAK_EXCEPTIONS:
-            _LOGGER.error(
-                "%s: communication failed",
-                self.address,
-                exc_info=True,
+            self._log_throttled(
+                "send-comm", logging.ERROR,
+                "%s: communication failed", self.address, exc_info=True,
             )
             raise
 
@@ -1007,10 +1132,7 @@ class TuyaBLEDevice:
                 BLEAK_BACKOFF_TIME,
                 ex,
             )
-            if self._is_paired:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
+            self._schedule_recovery(packets)
             raise BleakError from ex
         except BleakError as ex:
             # Disconnect so we can reset state and try again
@@ -1020,10 +1142,7 @@ class TuyaBLEDevice:
                 self.rssi,
                 ex,
             )
-            if self._is_paired:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
+            self._schedule_recovery(packets)
             raise
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
@@ -1038,19 +1157,19 @@ class TuyaBLEDevice:
                         False,
                     )
                 except:
-                    _LOGGER.error(
+                    self._log_throttled(
+                        "send-packet", logging.ERROR,
                         "%s: Error during sending packet",
-                        self.address,
-                        exc_info=True,
+                        self.address, exc_info=True,
                     )
                     if self._client and self._client.is_connected:
                         self._disconnected(self._client)
                     raise BleakError()
             else:
-                _LOGGER.error(
+                self._log_throttled(
+                    "send-nocli", logging.ERROR,
                     "%s: Client disconnected during sending packet",
                     self.address,
-                    exc_info=True,
                 )
                 raise BleakError()
 
